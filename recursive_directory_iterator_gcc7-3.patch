@@ -1,0 +1,877 @@
+--- libstdc++-v3/src/filesystem/dir.cc	2018-05-16 15:31:05.562083396 +0200
++++ libstdc++-v3/src/filesystem/dir_new.cc	2018-06-20 14:51:14.574091367 +0200
+@@ -31,6 +31,7 @@
+ #include <stack>
+ #include <string.h>
+ #include <errno.h>
++#include <regex>
+ #ifdef _GLIBCXX_HAVE_DIRENT_H
+ # ifdef _GLIBCXX_HAVE_SYS_TYPES_H
+ #  include <sys/types.h>
+@@ -70,6 +71,58 @@
+   file_type		type = file_type::none;
+ };
+ 
++struct fs::_Dir_r
++{
++  _Dir_r() : dirp(nullptr) { }
++
++  _Dir_r(DIR* dirp, const fs::path& path, const std::regex& reg, const fs::pattern_options& po) : dirp(dirp), path(path), reg(reg), po(po) { }
++
++  _Dir_r(_Dir_r&& d)
++  : dirp(std::exchange(d.dirp, nullptr)), path(std::move(d.path)),
++    entry(std::move(d.entry)), type(d.type),reg(std::move(d.reg)), po(std::move(d.po))
++  { }
++
++  _Dir_r& operator=(_Dir_r&&) = delete;
++
++  ~_Dir_r() {  if (dirp) ::closedir(dirp); }
++
++  bool advance(std::error_code*, directory_options = directory_options::none);
++
++  DIR*			dirp;
++  fs::path		path;
++  directory_entry	entry;
++  file_type		type = file_type::none;
++  std::regex reg;
++  fs::pattern_options po;
++};
++
++struct fs::_Dir_l
++{
++  _Dir_l() : dirp(nullptr) { }
++
++  _Dir_l(DIR* dirp, const fs::path& path, const std::function<bool(const char*)> lambda, const fs::pattern_options& po) : dirp(dirp), path(path), lambda(lambda), po(po) { }
++
++  _Dir_l(_Dir_l&& d)
++  : dirp(std::exchange(d.dirp, nullptr)), path(std::move(d.path)),
++    entry(std::move(d.entry)), type(d.type),lambda(std::move(d.lambda)), po(std::move(d.po))
++  { }
++
++  _Dir_l& operator=(_Dir_l&&) = delete;
++
++  ~_Dir_l() {  if (dirp) ::closedir(dirp); }
++
++  bool advance(std::error_code*, directory_options = directory_options::none);
++
++  DIR*			dirp;
++  fs::path		path;
++  directory_entry	entry;
++  file_type		type = file_type::none;
++  std::function<bool(const char*)> lambda;
++  fs::pattern_options po;
++};
++
++
++
+ namespace
+ {
+   template<typename Bitmask>
+@@ -104,6 +157,56 @@
+     return {};
+   }
+ 
++inline fs::_Dir_r
++  open_dir_r(const fs::path& p, fs::directory_options options,
++	   std::error_code* ec, const std::regex& reg, const fs::pattern_options& po)
++  {
++    if (ec)
++      ec->clear();
++
++    if (DIR* dirp = ::opendir(p.c_str()))
++      return {dirp, p, reg, po};
++
++    const int err = errno;
++    if (err == EACCES
++        && is_set(options, fs::directory_options::skip_permission_denied))
++      return {};
++
++    if (!ec)
++      _GLIBCXX_THROW_OR_ABORT(fs::filesystem_error(
++            "directory iterator cannot open directory", p,
++            std::error_code(err, std::generic_category())));
++
++    ec->assign(err, std::generic_category());
++    return {};
++  }
++
++inline fs::_Dir_l
++  open_dir_l(const fs::path& p, fs::directory_options options,
++	   std::error_code* ec, const std::function<bool(const char*)> lambda, const fs::pattern_options& po)
++  {
++    if (ec)
++      ec->clear();
++
++    if (DIR* dirp = ::opendir(p.c_str()))
++      return {dirp, p, lambda, po};
++
++    const int err = errno;
++    if (err == EACCES
++        && is_set(options, fs::directory_options::skip_permission_denied))
++      return {};
++
++    if (!ec)
++      _GLIBCXX_THROW_OR_ABORT(fs::filesystem_error(
++            "directory iterator cannot open directory", p,
++            std::error_code(err, std::generic_category())));
++
++    ec->assign(err, std::generic_category());
++    return {};
++  }
++
++
++
+   inline fs::file_type
+   get_file_type(const ::dirent& d __attribute__((__unused__)))
+   {
+@@ -179,6 +282,94 @@
+     }
+ }
+ 
++bool
++fs::_Dir_r::advance(error_code* ec, directory_options options)
++{
++  if (ec)
++    ec->clear();
++
++  int err = std::exchange(errno, 0);
++  const auto entp = readdir(dirp);
++  std::swap(errno, err);
++
++  if (entp)
++    {
++      // skip past dot and dot-dot
++      if ( !strcmp(entp->d_name, ".") || !strcmp(entp->d_name, "..") || (entp->d_type != DT_DIR && !std::regex_match(entp->d_name, reg)))
++      { 
++	      return advance(ec, options);
++      }
++      entry = fs::directory_entry{path / entp->d_name};
++      type = get_file_type(*entp);
++      return true;
++    }
++  else if (err)
++    {
++      if (err == EACCES
++        && is_set(options, directory_options::skip_permission_denied))
++	return false;
++
++      if (!ec)
++	_GLIBCXX_THROW_OR_ABORT(filesystem_error(
++	      "directory iterator cannot advance",
++	      std::error_code(err, std::generic_category())));
++      ec->assign(err, std::generic_category());
++      return false;
++    }
++  else
++    {
++      // reached the end
++      entry = {};
++      type = fs::file_type::none;
++      return false;
++    }
++}
++
++bool
++fs::_Dir_l::advance(error_code* ec, directory_options options)
++{
++  if (ec)
++    ec->clear();
++
++  int err = std::exchange(errno, 0);
++  const auto entp = readdir(dirp);
++  std::swap(errno, err);
++
++  if (entp)
++    {
++      // skip past dot and dot-dot
++      if ( !strcmp(entp->d_name, ".") || !strcmp(entp->d_name, "..") || (entp->d_type != DT_DIR && !lambda(entp->d_name)))
++      { 
++	      return advance(ec, options);
++      }
++      entry = fs::directory_entry{path / entp->d_name};
++      type = get_file_type(*entp);
++      return true;
++    }
++  else if (err)
++    {
++      if (err == EACCES
++        && is_set(options, directory_options::skip_permission_denied))
++	return false;
++
++      if (!ec)
++	_GLIBCXX_THROW_OR_ABORT(filesystem_error(
++	      "directory iterator cannot advance",
++	      std::error_code(err, std::generic_category())));
++      ec->assign(err, std::generic_category());
++      return false;
++    }
++  else
++    {
++      // reached the end
++      entry = {};
++      type = fs::file_type::none;
++      return false;
++    }
++}
++
++
++
+ fs::directory_iterator::
+ directory_iterator(const path& p, directory_options options, error_code* ec)
+ {
+@@ -234,6 +425,18 @@
+   void clear() { c.clear(); }
+ };
+ 
++struct fs::recursive_directory_iterator_r::_Dir_stack_r : std::stack<_Dir_r>
++{
++  void clear() { c.clear(); }
++};
++
++struct fs::recursive_directory_iterator_l::_Dir_stack_l : std::stack<_Dir_l>
++{
++  void clear() { c.clear(); }
++};
++
++
++
+ fs::recursive_directory_iterator::
+ recursive_directory_iterator(const path& p, directory_options options,
+                              error_code* ec)
+@@ -266,6 +469,91 @@
+     }
+ }
+ 
++fs::recursive_directory_iterator_r::
++recursive_directory_iterator_r(const path& p, directory_options options,
++                             error_code* ec, const std::regex& reg, const pattern_options& po)
++: _M_options(options), _M_pending(true)
++{
++   
++  if (DIR* dirp = ::opendir(p.c_str()))
++  {
++      auto sp = std::make_shared<_Dir_stack_r>();
++      sp->push(_Dir_r{ dirp, p, reg, po});
++      if (sp->top().advance(ec))
++      {	       
++         _M_dirs.swap(sp);
++      }
++
++      if( po == fs::pattern_options::file_only && _M_dirs->top().type == fs::file_type::directory )
++      {
++         error_code err;
++         increment(err);
++      }
++  }
++  else
++    {
++      const int err = errno;
++      if (err == EACCES
++	  && is_set(options, fs::directory_options::skip_permission_denied))
++	{
++	  if (ec)
++	    ec->clear();
++	  return;
++	}
++
++      if (!ec)
++	_GLIBCXX_THROW_OR_ABORT(filesystem_error(
++	      "recursive directory iterator cannot open directory", p,
++	      std::error_code(err, std::generic_category())));
++
++      ec->assign(err, std::generic_category());
++    }
++}
++
++fs::recursive_directory_iterator_l::
++recursive_directory_iterator_l(const path& p, directory_options options,
++                             error_code* ec, const std::function<bool(const char*)> lambda, const pattern_options& po)
++: _M_options(options), _M_pending(true)
++{
++   
++  if (DIR* dirp = ::opendir(p.c_str()))
++  {
++      auto sp = std::make_shared<_Dir_stack_l>();
++      sp->push(_Dir_l{ dirp, p, lambda, po});
++      if (sp->top().advance(ec))
++      {	       
++         _M_dirs.swap(sp);
++      }
++   
++      if( po == fs::pattern_options::file_only && _M_dirs->top().type == fs::file_type::directory )
++      {
++         error_code err;
++         increment(err);
++      }
++
++  }
++  else
++    {
++      const int err = errno;
++      if (err == EACCES
++	  && is_set(options, fs::directory_options::skip_permission_denied))
++	{
++	  if (ec)
++	    ec->clear();
++	  return;
++	}
++
++      if (!ec)
++	_GLIBCXX_THROW_OR_ABORT(filesystem_error(
++	      "recursive directory iterator cannot open directory", p,
++	      std::error_code(err, std::generic_category())));
++
++      ec->assign(err, std::generic_category());
++    }
++}
++
++
++
+ fs::recursive_directory_iterator::~recursive_directory_iterator() = default;
+ 
+ int
+@@ -299,6 +587,73 @@
+   return *this;
+ }
+ 
++
++fs::recursive_directory_iterator_r::~recursive_directory_iterator_r() = default;
++
++int
++fs::recursive_directory_iterator_r::depth() const
++{
++  return int(_M_dirs->size()) - 1;
++}
++
++const fs::directory_entry&
++fs::recursive_directory_iterator_r::operator*() const
++{
++  return _M_dirs->top().entry;
++}
++
++fs::recursive_directory_iterator_r&
++fs::recursive_directory_iterator_r::
++operator=(const recursive_directory_iterator_r& other) noexcept = default;
++
++fs::recursive_directory_iterator_r&
++fs::recursive_directory_iterator_r::
++operator=(recursive_directory_iterator_r&& other) noexcept = default;
++
++fs::recursive_directory_iterator_r&
++fs::recursive_directory_iterator_r::operator++()
++{
++  error_code ec;
++  increment(ec);
++  if (ec.value())
++    _GLIBCXX_THROW_OR_ABORT(filesystem_error(
++	  "cannot increment recursive directory iterator", ec));
++  return *this;
++}
++
++int
++fs::recursive_directory_iterator_l::depth() const
++{
++  return int(_M_dirs->size()) - 1;
++}
++
++const fs::directory_entry&
++fs::recursive_directory_iterator_l::operator*() const
++{
++  return _M_dirs->top().entry;
++}
++
++fs::recursive_directory_iterator_l&
++fs::recursive_directory_iterator_l::
++operator=(const recursive_directory_iterator_l& other) noexcept = default;
++
++fs::recursive_directory_iterator_l&
++fs::recursive_directory_iterator_l::
++operator=(recursive_directory_iterator_l&& other) noexcept = default;
++
++fs::recursive_directory_iterator_l&
++fs::recursive_directory_iterator_l::operator++()
++{
++  error_code ec;
++  increment(ec);
++  if (ec.value())
++    _GLIBCXX_THROW_OR_ABORT(filesystem_error(
++	  "cannot increment recursive directory iterator", ec));
++  return *this;
++}
++
++fs::recursive_directory_iterator_l::~recursive_directory_iterator_l() = default;
++
+ namespace
+ {
+   bool
+@@ -326,6 +681,58 @@
+       }
+     return type == fs::file_type::directory;
+   }
++
++bool
++  recurse(const fs::_Dir_r& d, fs::directory_options options, std::error_code& ec)
++  {
++    bool follow_symlink
++      = is_set(options, fs::directory_options::follow_directory_symlink);
++#ifdef _GLIBCXX_HAVE_STRUCT_DIRENT_D_TYPE
++    if (d.type == fs::file_type::directory)
++      return true;
++    if (d.type == fs::file_type::symlink && follow_symlink)
++      return d.entry.status().type() == fs::file_type::directory;
++    if (d.type != fs::file_type::none && d.type != fs::file_type::unknown)
++      return false;
++#endif
++    const fs::path& path = d.entry.path();
++    auto type = fs::symlink_status(path, ec).type();
++    if (ec.value())
++      return false;
++    if (type == fs::file_type::symlink)
++      {
++	if (!follow_symlink)
++	  return false;
++	type = fs::status(path, ec).type();
++      }
++    return type == fs::file_type::directory;
++  } 
++
++ bool
++  recurse(const fs::_Dir_l& d, fs::directory_options options, std::error_code& ec)
++  {
++    bool follow_symlink
++      = is_set(options, fs::directory_options::follow_directory_symlink);
++#ifdef _GLIBCXX_HAVE_STRUCT_DIRENT_D_TYPE
++    if (d.type == fs::file_type::directory)
++      return true;
++    if (d.type == fs::file_type::symlink && follow_symlink)
++      return d.entry.status().type() == fs::file_type::directory;
++    if (d.type != fs::file_type::none && d.type != fs::file_type::unknown)
++      return false;
++#endif
++    const fs::path& path = d.entry.path();
++    auto type = fs::symlink_status(path, ec).type();
++    if (ec.value())
++      return false;
++    if (type == fs::file_type::symlink)
++      {
++	if (!follow_symlink)
++	  return false;
++	type = fs::status(path, ec).type();
++      }
++    return type == fs::file_type::directory;
++  }
+ }
+ 
+ fs::recursive_directory_iterator&
+@@ -363,6 +770,88 @@
+   return *this;
+ }
+ 
++fs::recursive_directory_iterator_r&
++fs::recursive_directory_iterator_r::increment(error_code& ec) noexcept{
++  if (!_M_dirs)
++    {
++      ec = std::make_error_code(errc::invalid_argument);
++      return *this;
++    }
++
++  auto& top = _M_dirs->top();
++
++  if (std::exchange(_M_pending, true) && recurse(top, _M_options, ec))
++    {
++      _Dir_r dir = open_dir_r(top.entry.path(), _M_options, &ec, top.reg, top.po);
++      if (ec)
++	{
++	  _M_dirs.reset();
++	  return *this;
++	}
++      if (dir.dirp)
++	  _M_dirs->push(std::move(dir));
++    }
++
++  while (!_M_dirs->top().advance(&ec, _M_options) && !ec)
++    {
++      _M_dirs->pop();
++      if (_M_dirs->empty())
++	{
++	  _M_dirs.reset();
++	  return *this;
++	}
++    }
++   
++   auto& new_top = _M_dirs->top();
++   if( new_top.po == fs::pattern_options::file_only && new_top.type == fs::file_type::directory )
++      increment(ec);
++ 
++  return *this;
++}
++
++
++fs::recursive_directory_iterator_l&
++fs::recursive_directory_iterator_l::increment(error_code& ec) noexcept{
++  if (!_M_dirs)
++    {
++      ec = std::make_error_code(errc::invalid_argument);
++      return *this;
++    }
++
++  auto& top = _M_dirs->top();
++
++  if (std::exchange(_M_pending, true) && recurse(top, _M_options, ec))
++    {
++      _Dir_l dir = open_dir_l(top.entry.path(), _M_options, &ec, top.lambda, top.po);
++      if (ec)
++	{
++	  _M_dirs.reset();
++	  return *this;
++	}
++      if (dir.dirp)
++	  _M_dirs->push(std::move(dir));
++    }
++
++  while (!_M_dirs->top().advance(&ec, _M_options) && !ec)
++    {
++      _M_dirs->pop();
++      if (_M_dirs->empty())
++	{
++	  _M_dirs.reset();
++	  return *this;
++	}
++    }
++   
++   auto& new_top = _M_dirs->top();
++   if( new_top.po == fs::pattern_options::file_only && new_top.type == fs::file_type::directory )
++      increment(ec);
++ 
++  return *this;
++}
++
++
++
++
+ void
+ fs::recursive_directory_iterator::pop(error_code& ec)
+ {
+@@ -394,3 +883,71 @@
+ 	  : "non-dereferenceable recursive directory iterator cannot pop",
+ 	  ec));
+ }
++
++
++
++void
++fs::recursive_directory_iterator_r::pop(error_code& ec)
++{
++  if (!_M_dirs)
++    {
++      ec = std::make_error_code(errc::invalid_argument);
++      return;
++    }
++
++  do {
++    _M_dirs->pop();
++    if (_M_dirs->empty())
++      {
++	_M_dirs.reset();
++	ec.clear();
++	return;
++      }
++  } while (!_M_dirs->top().advance(&ec, _M_options));
++}
++
++void
++fs::recursive_directory_iterator_r::pop()
++{
++  error_code ec;
++  pop(ec);
++  if (ec)
++    _GLIBCXX_THROW_OR_ABORT(filesystem_error(_M_dirs
++	  ? "recursive directory iterator cannot pop"
++	  : "non-dereferenceable recursive directory iterator cannot pop",
++	  ec));
++}
++
++
++void
++fs::recursive_directory_iterator_l::pop(error_code& ec)
++{
++  if (!_M_dirs)
++    {
++      ec = std::make_error_code(errc::invalid_argument);
++      return;
++    }
++
++  do {
++    _M_dirs->pop();
++    if (_M_dirs->empty())
++      {
++	_M_dirs.reset();
++	ec.clear();
++	return;
++      }
++  } while (!_M_dirs->top().advance(&ec, _M_options));
++}
++
++void
++fs::recursive_directory_iterator_l::pop()
++{
++  error_code ec;
++  pop(ec);
++  if (ec)
++    _GLIBCXX_THROW_OR_ABORT(filesystem_error(_M_dirs
++	  ? "recursive directory iterator cannot pop"
++	  : "non-dereferenceable recursive directory iterator cannot pop",
++	  ec));
++}
++
+--- libstdc++-v3/include/experimental/bits/fs_dir.h	2018-06-20 16:32:58.959724842 +0200
++++ libstdc++-v3/include/experimental/bits/fs_dir_new.h	2018-06-01 17:30:50.841627696 +0200
+@@ -37,7 +37,7 @@
+ # include <ext/concurrence.h>
+ # include <bits/unique_ptr.h>
+ # include <bits/shared_ptr.h>
+-
++# include <regex>
+ namespace std _GLIBCXX_VISIBILITY(default)
+ {
+ namespace experimental
+@@ -84,6 +84,13 @@
+ 
+ _GLIBCXX_BEGIN_NAMESPACE_CXX11
+ 
++   enum class pattern_options
++   {
++      file_only,
++      folder_only,
++      none
++   };
++
+   class directory_entry
+   {
+   public:
+@@ -156,6 +163,14 @@
+   class directory_iterator;
+   class recursive_directory_iterator;
+ 
++  struct _Dir_r;
++  class recursive_directory_iterator_r;
++
++  struct _Dir_l;
++  class recursive_directory_iterator_l;
++
++
++
+   struct __directory_iterator_proxy
+   {
+     const directory_entry& operator*() const& noexcept { return _M_entry; }
+@@ -165,6 +180,8 @@
+   private:
+     friend class directory_iterator;
+     friend class recursive_directory_iterator;
++    friend class recursive_directory_iterator_r;
++    friend class recursive_directory_iterator_l;
+ 
+     explicit
+     __directory_iterator_proxy(const directory_entry& __e) : _M_entry(__e) { }
+@@ -349,6 +366,201 @@
+              const recursive_directory_iterator& __rhs)
+   { return !(__lhs == __rhs); }
+ 
++
++class recursive_directory_iterator_r
++  {
++  public:
++    typedef directory_entry        value_type;
++    typedef ptrdiff_t              difference_type;
++    typedef const directory_entry* pointer;
++    typedef const directory_entry& reference;
++    typedef input_iterator_tag     iterator_category;
++
++    recursive_directory_iterator_r() = default;
++
++    explicit
++    recursive_directory_iterator_r(const path& __p, const regex& reg, const pattern_options& po)
++    : recursive_directory_iterator_r(__p, directory_options::none, nullptr, reg, po) { }
++
++    recursive_directory_iterator_r(const path& __p, directory_options __options)
++    : recursive_directory_iterator_r(__p, __options, nullptr, regex("\\.|\\.\\."), pattern_options::none) { }
++
++    recursive_directory_iterator_r(const path& __p,
++                                 directory_options __options,
++                                 error_code& __ec) noexcept
++    : recursive_directory_iterator_r(__p, __options, &__ec, regex("\\.|\\.\\."), pattern_options::none) { }
++
++    recursive_directory_iterator_r(const path& __p, error_code& __ec) noexcept
++    : recursive_directory_iterator_r(__p, directory_options::none, &__ec, regex("\\.|\\.\\."), pattern_options::none) { }
++
++    recursive_directory_iterator_r(
++        const recursive_directory_iterator_r&) = default;
++
++    recursive_directory_iterator_r(recursive_directory_iterator_r&&) = default;
++
++    ~recursive_directory_iterator_r();
++
++    // observers
++    directory_options  options() const { return _M_options; }
++    int                depth() const;
++    bool               recursion_pending() const { return _M_pending; }
++
++    const directory_entry& operator*() const;
++    const directory_entry* operator->() const { return &**this; }
++
++    // modifiers
++    recursive_directory_iterator_r&
++    operator=(const recursive_directory_iterator_r& __rhs) noexcept;
++    recursive_directory_iterator_r&
++    operator=(recursive_directory_iterator_r&& __rhs) noexcept;
++
++    recursive_directory_iterator_r& operator++();
++    recursive_directory_iterator_r& increment(error_code& __ec) noexcept;
++
++    __directory_iterator_proxy operator++(int)
++    {
++      __directory_iterator_proxy __pr{**this};
++      ++*this;
++      return __pr;
++    }
++
++    void pop();
++    void pop(error_code&);
++
++    void disable_recursion_pending() { _M_pending = false; }
++
++  private:
++    recursive_directory_iterator_r(const path&, directory_options, error_code*, const regex&, const pattern_options&);
++
++    friend bool
++    operator==(const recursive_directory_iterator_r& __lhs,
++               const recursive_directory_iterator_r& __rhs);
++
++    struct _Dir_stack_r;
++    std::shared_ptr<_Dir_stack_r> _M_dirs;
++    directory_options _M_options = {};
++    bool _M_pending = false;
++  };
++
++  inline recursive_directory_iterator_r
++  begin(recursive_directory_iterator_r __iter) noexcept
++  { return __iter; }
++
++  inline recursive_directory_iterator_r
++  end(recursive_directory_iterator_r) noexcept
++  { return recursive_directory_iterator_r(); }
++
++  inline bool
++  operator==(const recursive_directory_iterator_r& __lhs,
++             const recursive_directory_iterator_r& __rhs)
++  {
++    return !__rhs._M_dirs.owner_before(__lhs._M_dirs)
++      && !__lhs._M_dirs.owner_before(__rhs._M_dirs);
++  }
++
++  inline bool
++  operator!=(const recursive_directory_iterator_r& __lhs,
++             const recursive_directory_iterator_r& __rhs)
++  { return !(__lhs == __rhs); }
++
++
++class recursive_directory_iterator_l
++  {
++  public:
++    typedef directory_entry        value_type;
++    typedef ptrdiff_t              difference_type;
++    typedef const directory_entry* pointer;
++    typedef const directory_entry& reference;
++    typedef input_iterator_tag     iterator_category;
++
++    recursive_directory_iterator_l() = default;
++
++    explicit
++    recursive_directory_iterator_l(const path& __p, const std::function<bool(const char* )> lambda, const pattern_options& po)
++    : recursive_directory_iterator_l(__p, directory_options::none, nullptr, lambda, po) { }
++
++    recursive_directory_iterator_l(const path& __p, directory_options __options)
++    : recursive_directory_iterator_l(__p, __options, nullptr, [](const char*){ return true;}, pattern_options::none) { }
++
++    recursive_directory_iterator_l(const path& __p,
++                                 directory_options __options,
++                                 error_code& __ec) noexcept
++    : recursive_directory_iterator_l(__p, __options, &__ec, [](const char* ){return true;}, pattern_options::none) { }
++
++    recursive_directory_iterator_l(const path& __p, error_code& __ec) noexcept
++    : recursive_directory_iterator_l(__p, directory_options::none, &__ec,  [](const char* ){return true;}, pattern_options::none) { }
++
++    recursive_directory_iterator_l(
++        const recursive_directory_iterator_l&) = default;
++
++    recursive_directory_iterator_l(recursive_directory_iterator_l&&) = default;
++
++    ~recursive_directory_iterator_l();
++
++    // observers
++    directory_options  options() const { return _M_options; }
++    int                depth() const;
++    bool               recursion_pending() const { return _M_pending; }
++
++    const directory_entry& operator*() const;
++    const directory_entry* operator->() const { return &**this; }
++
++    // modifiers
++    recursive_directory_iterator_l&
++    operator=(const recursive_directory_iterator_l& __rhs) noexcept;
++    recursive_directory_iterator_l&
++    operator=(recursive_directory_iterator_l&& __rhs) noexcept;
++
++    recursive_directory_iterator_l& operator++();
++    recursive_directory_iterator_l& increment(error_code& __ec) noexcept;
++
++    __directory_iterator_proxy operator++(int)
++    {
++      __directory_iterator_proxy __pr{**this};
++      ++*this;
++      return __pr;
++    }
++
++    void pop();
++    void pop(error_code&);
++
++    void disable_recursion_pending() { _M_pending = false; }
++
++  private:
++    recursive_directory_iterator_l(const path&, directory_options, error_code*, const std::function<bool(const char* )> lambda, const pattern_options& po);
++
++    friend bool
++    operator==(const recursive_directory_iterator_l& __lhs,
++               const recursive_directory_iterator_l& __rhs);
++
++    struct _Dir_stack_l;
++    std::shared_ptr<_Dir_stack_l> _M_dirs;
++    directory_options _M_options = {};
++    bool _M_pending = false;
++  };
++
++  inline recursive_directory_iterator_l
++  begin(recursive_directory_iterator_l __iter) noexcept
++  { return __iter; }
++
++  inline recursive_directory_iterator_l
++  end(recursive_directory_iterator_l) noexcept
++  { return recursive_directory_iterator_l(); }
++
++  inline bool
++  operator==(const recursive_directory_iterator_l& __lhs,
++             const recursive_directory_iterator_l& __rhs)
++  {
++    return !__rhs._M_dirs.owner_before(__lhs._M_dirs)
++      && !__lhs._M_dirs.owner_before(__rhs._M_dirs);
++  }
++
++  inline bool
++  operator!=(const recursive_directory_iterator_l& __lhs,
++             const recursive_directory_iterator_l& __rhs)
++  { return !(__lhs == __rhs); }
++
++
+ _GLIBCXX_END_NAMESPACE_CXX11
+ 
+   // @} group filesystem
