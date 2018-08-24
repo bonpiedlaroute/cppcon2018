@@ -1,0 +1,678 @@
+--- llvm/include/llvm/Support/FileSystem.h	jeu. avr.  5 21:43:24 2018
++++ llvm/include/llvm/Support/FileSystem_new.h	mar. août 21 11:34:41 2018
+@@ -46,0 +47 @@
++#include <regex>
+@@ -55,0 +57 @@ namespace fs {
++
+@@ -101,0 +104,6 @@ enum perms {
++enum class pattern_options
++{
++   file_only,
++   folder_only,
++   none
++};
+@@ -926,0 +935,2 @@ namespace detail {
++  struct DirIterState_r;
++  struct DirIterState_l;
+@@ -931,0 +942,9 @@ namespace detail {
++
++  std::error_code directory_iterator_construct(DirIterState_r &, StringRef, bool, const std::regex&, const pattern_options&);
++  std::error_code directory_iterator_increment(DirIterState_r &);
++  std::error_code directory_iterator_destruct(DirIterState_r &);
++
++  std::error_code directory_iterator_construct(DirIterState_l &, StringRef, bool, const std::function<bool(const char*)>&, const pattern_options&);
++  std::error_code directory_iterator_increment(DirIterState_l &);
++  std::error_code directory_iterator_destruct(DirIterState_l &);
++
+@@ -941,0 +961,22 @@ namespace detail {
++  struct DirIterState_r {
++     ~DirIterState_r() {
++        directory_iterator_destruct(*this);
++     }
++
++     intptr_t IterationHandle = 0;
++     directory_entry CurrentEntry;
++     std::regex regex;
++     pattern_options options;
++  };
++
++  struct DirIterState_l {
++     ~DirIterState_l() {
++        directory_iterator_destruct(*this);
++     }
++
++     intptr_t IterationHandle = 0;
++     directory_entry CurrentEntry;
++     std::function<bool (const char*)> lambda;
++     pattern_options options;
++  };
++
+@@ -1018,0 +1060,147 @@ class directory_iterator {
++class directory_iterator_r {
++   std::shared_ptr<detail::DirIterState_r> State;
++   bool FollowSymlinks = true;
++
++public:
++   explicit directory_iterator_r(const Twine &path, std::error_code &ec,
++       const std::regex& regex, const pattern_options& options, bool follow_symlinks = true)
++      : FollowSymlinks(follow_symlinks) {
++      State = std::make_shared<detail::DirIterState_r>();
++      SmallString<128> path_storage;
++      ec = detail::directory_iterator_construct(
++         *State, path.toStringRef(path_storage), FollowSymlinks, regex, options);
++      update_error_code_for_current_entry(ec);
++   }
++
++   explicit directory_iterator_r(const directory_entry &de, std::error_code &ec,
++       const std::regex & regex, const pattern_options& options, bool follow_symlinks = true)
++      : FollowSymlinks(follow_symlinks) {
++      State = std::make_shared<detail::DirIterState_r>();
++      ec = detail::directory_iterator_construct(
++         *State, de.path(), FollowSymlinks, regex, options);
++      update_error_code_for_current_entry(ec);
++   }
++
++   /// Construct end iterator.
++   directory_iterator_r() = default;
++
++   // No operator++ because we need error_code.
++   directory_iterator_r &increment(std::error_code &ec) {
++      ec = directory_iterator_increment(*State);
++      update_error_code_for_current_entry(ec);
++      return *this;
++   }
++
++   const directory_entry &operator*() const { return State->CurrentEntry; }
++   const directory_entry *operator->() const { return &State->CurrentEntry; }
++
++   bool operator==(const directory_iterator_r &RHS) const {
++      if (State == RHS.State)
++         return true;
++      if (!RHS.State)
++         return State->CurrentEntry == directory_entry();
++      if (!State)
++         return RHS.State->CurrentEntry == directory_entry();
++      return State->CurrentEntry == RHS.State->CurrentEntry;
++   }
++
++   bool operator!=(const directory_iterator_r &RHS) const {
++      return !(*this == RHS);
++   }
++   const std::regex & getFilter() const { return State->regex; }
++   const pattern_options & getOptions() const { return State->options;  }
++   // Other members as required by
++   // C++ Std, 24.1.1 Input iterators [input.iterators]
++
++private:
++   // Checks if current entry is valid and populates error code. For example,
++   // current entry may not exist due to broken symbol links.
++   void update_error_code_for_current_entry(std::error_code &ec) {
++      // Bail out if error has already occured earlier to avoid overwriting it.
++      if (ec)
++         return;
++
++      // Empty directory entry is used to mark the end of an interation, it's not
++      // an error.
++      if (State->CurrentEntry == directory_entry())
++         return;
++
++      ErrorOr<basic_file_status> status = State->CurrentEntry.status();
++      if (!status)
++         ec = status.getError();
++   }
++};
++
++class directory_iterator_l {
++   std::shared_ptr<detail::DirIterState_l> State;
++   bool FollowSymlinks = true;
++
++public:
++   explicit directory_iterator_l(const Twine &path, std::error_code &ec,
++      const std::function<bool(const char*)>& lambda, const pattern_options& options, bool follow_symlinks = true)
++      : FollowSymlinks(follow_symlinks) {
++      State = std::make_shared<detail::DirIterState_l>();
++      SmallString<128> path_storage;
++      ec = detail::directory_iterator_construct(
++         *State, path.toStringRef(path_storage), FollowSymlinks, lambda, options);
++      update_error_code_for_current_entry(ec);
++   }
++
++   explicit directory_iterator_l(const directory_entry &de, std::error_code &ec,
++      const std::function<bool(const char*)>& lambda, const pattern_options& options, bool follow_symlinks = true)
++      : FollowSymlinks(follow_symlinks) {
++      State = std::make_shared<detail::DirIterState_l>();
++      ec = detail::directory_iterator_construct(
++         *State, de.path(), FollowSymlinks, lambda, options);
++      update_error_code_for_current_entry(ec);
++   }
++
++   /// Construct end iterator.
++   directory_iterator_l() = default;
++
++   // No operator++ because we need error_code.
++   directory_iterator_l &increment(std::error_code &ec) {
++      ec = directory_iterator_increment(*State);
++      update_error_code_for_current_entry(ec);
++      return *this;
++   }
++
++   const directory_entry &operator*() const { return State->CurrentEntry; }
++   const directory_entry *operator->() const { return &State->CurrentEntry; }
++
++   bool operator==(const directory_iterator_l &RHS) const {
++      if (State == RHS.State)
++         return true;
++      if (!RHS.State)
++         return State->CurrentEntry == directory_entry();
++      if (!State)
++         return RHS.State->CurrentEntry == directory_entry();
++      return State->CurrentEntry == RHS.State->CurrentEntry;
++   }
++
++   bool operator!=(const directory_iterator_l &RHS) const {
++      return !(*this == RHS);
++   }
++   const std::function<bool(const char*)> & getFilter() const { return State->lambda; }
++   const pattern_options & getOptions() const { return State->options; }
++
++
++private:
++   // Checks if current entry is valid and populates error code. For example,
++   // current entry may not exist due to broken symbol links.
++   void update_error_code_for_current_entry(std::error_code &ec) {
++      // Bail out if error has already occured earlier to avoid overwriting it.
++      if (ec)
++         return;
++
++      // Empty directory entry is used to mark the end of an interation, it's not
++      // an error.
++      if (State->CurrentEntry == directory_entry())
++         return;
++
++      ErrorOr<basic_file_status> status = State->CurrentEntry.status();
++      if (!status)
++         ec = status.getError();
++   }
++};
++
+@@ -1027,0 +1216,12 @@ namespace detail {
++  struct RecDirIterState_r {
++     std::stack<directory_iterator_r, std::vector<directory_iterator_r>> Stack;
++     uint16_t Level = 0;
++     bool HasNoPushRequest = false;
++  };
++
++  struct RecDirIterState_l {
++     std::stack<directory_iterator_l, std::vector<directory_iterator_l>> Stack;
++     uint16_t Level = 0;
++     bool HasNoPushRequest = false;
++  };
++
+@@ -1122,0 +1323,244 @@ class recursive_directory_iterator {
++class recursive_directory_iterator_r {
++   std::shared_ptr<detail::RecDirIterState_r> State;
++   bool Follow;
++
++public:
++   recursive_directory_iterator_r() = default;
++   explicit recursive_directory_iterator_r(const Twine &path, std::error_code &ec,
++      const std::regex& regex, const pattern_options& options, bool follow_symlinks = true)
++      : State(std::make_shared<detail::RecDirIterState_r>()),
++      Follow(follow_symlinks) {
++      State->Stack.push(directory_iterator_r(path, ec, regex, options, Follow));
++      if (State->Stack.top() == directory_iterator_r())
++         State.reset();
++      ErrorOr<basic_file_status> status = State->Stack.top()->status();
++      if (status && is_directory(*status) )
++      {
++         increment(ec);
++      }
++   }
++
++   // No operator++ because we need error_code.
++   recursive_directory_iterator_r &increment(std::error_code &ec) {
++      while (true)
++      {
++         const directory_iterator_r end_itr = {};
++
++         if (State->HasNoPushRequest)
++            State->HasNoPushRequest = false;
++         else {
++            auto top = State->Stack.top();
++            ErrorOr<basic_file_status> status = top->status();
++            if (status && is_directory(*status)) {
++               State->Stack.push(directory_iterator_r(*top, ec, top.getFilter(), top.getOptions(), Follow));
++               auto new_top = State->Stack.top();
++               if (new_top != end_itr) {
++                  ++State->Level;
++
++                  status = new_top->status();
++                  if (status && is_directory(*status) && (new_top.getOptions() == pattern_options::file_only))
++                  {
++                     continue;
++                  }
++                  else
++                  {
++                     return *this;
++                  }
++               }
++               State->Stack.pop();
++            }
++         }
++
++         while (!State->Stack.empty()
++            && State->Stack.top().increment(ec) == end_itr) {
++            State->Stack.pop();
++            --State->Level;
++         }
++
++         // Check if we are done. If so, create an end iterator.
++         if (State->Stack.empty())
++         {
++            State.reset();
++            return *this;
++         }
++            
++         auto top = State->Stack.top();
++         ErrorOr<basic_file_status> status = top->status();
++         if (status && is_directory(*status) && (top.getOptions() == pattern_options::file_only))
++         {
++            continue;
++         }
++         else
++         {
++            return *this;
++         }
++      }
++      
++   }
++
++   const directory_entry &operator*() const { return *State->Stack.top(); }
++   const directory_entry *operator->() const { return &*State->Stack.top(); }
++
++   // observers
++   /// Gets the current level. Starting path is at level 0.
++   int level() const { return State->Level; }
++
++   /// Returns true if no_push has been called for this directory_entry.
++   bool no_push_request() const { return State->HasNoPushRequest; }
++
++   // modifiers
++   /// Goes up one level if Level > 0.
++   void pop() {
++      assert(State && "Cannot pop an end iterator!");
++      assert(State->Level > 0 && "Cannot pop an iterator with level < 1");
++
++      const directory_iterator_r end_itr = {};
++      std::error_code ec;
++      do {
++         if (ec)
++            report_fatal_error("Error incrementing directory iterator.");
++         State->Stack.pop();
++         --State->Level;
++      } while (!State->Stack.empty()
++         && State->Stack.top().increment(ec) == end_itr);
++
++      // Check if we are done. If so, create an end iterator.
++      if (State->Stack.empty())
++         State.reset();
++   }
++
++   /// Does not go down into the current directory_entry.
++   void no_push() { State->HasNoPushRequest = true; }
++
++   bool operator==(const recursive_directory_iterator_r &RHS) const {
++      return State == RHS.State;
++   }
++
++   bool operator!=(const recursive_directory_iterator_r &RHS) const {
++      return !(*this == RHS);
++   }
++};
++
++
++class recursive_directory_iterator_l {
++   std::shared_ptr<detail::RecDirIterState_l> State;
++   bool Follow;
++
++public:
++   recursive_directory_iterator_l() = default;
++   explicit recursive_directory_iterator_l(const Twine &path, std::error_code &ec,
++      std::function<bool(const char*)> lambda, const pattern_options& options, bool follow_symlinks = true)
++      : State(std::make_shared<detail::RecDirIterState_l>()),
++      Follow(follow_symlinks) {
++      State->Stack.push(directory_iterator_l(path, ec, lambda, options, Follow));
++      if (State->Stack.top() == directory_iterator_l())
++         State.reset();
++      ErrorOr<basic_file_status> status = State->Stack.top()->status();
++      if (status && is_directory(*status))
++      {
++         increment(ec);
++      }
++   }
++
++   // No operator++ because we need error_code.
++   recursive_directory_iterator_l &increment(std::error_code &ec) {
++      while (true)
++      {
++         const directory_iterator_l end_itr = {};
++
++         if (State->HasNoPushRequest)
++            State->HasNoPushRequest = false;
++         else {
++            auto top = State->Stack.top();
++            ErrorOr<basic_file_status> status = top->status();
++            if (status && is_directory(*status)) {
++               State->Stack.push(directory_iterator_l(*top, ec, top.getFilter(), top.getOptions(), Follow));
++
++               auto new_top = State->Stack.top();
++               if (new_top != end_itr) {
++                  ++State->Level;
++
++                  status = new_top->status();
++                  if (status && is_directory(*status) && (new_top.getOptions() == pattern_options::file_only))
++                  {
++                     continue;
++                  }
++                  else
++                  {
++                     return *this;
++                  }
++               }
++               State->Stack.pop();
++            }
++         }
++
++         while (!State->Stack.empty()
++            && State->Stack.top().increment(ec) == end_itr) {
++            State->Stack.pop();
++            --State->Level;
++         }
++
++         // Check if we are done. If so, create an end iterator.
++         if (State->Stack.empty())
++         {
++            State.reset();
++            return *this;
++         }
++
++         auto top = State->Stack.top();
++         ErrorOr<basic_file_status> status = top->status();
++         if (status && is_directory(*status) && (top.getOptions() == pattern_options::file_only))
++         {
++            continue;
++         }
++         else
++         {
++            return *this;
++         }
++      }
++
++   }
++
++   const directory_entry &operator*() const { return *State->Stack.top(); }
++   const directory_entry *operator->() const { return &*State->Stack.top(); }
++
++   // observers
++   /// Gets the current level. Starting path is at level 0.
++   int level() const { return State->Level; }
++
++   /// Returns true if no_push has been called for this directory_entry.
++   bool no_push_request() const { return State->HasNoPushRequest; }
++
++   // modifiers
++   /// Goes up one level if Level > 0.
++   void pop() {
++      assert(State && "Cannot pop an end iterator!");
++      assert(State->Level > 0 && "Cannot pop an iterator with level < 1");
++
++      const directory_iterator_l end_itr = {};
++      std::error_code ec;
++      do {
++         if (ec)
++            report_fatal_error("Error incrementing directory iterator.");
++         State->Stack.pop();
++         --State->Level;
++      } while (!State->Stack.empty()
++         && State->Stack.top().increment(ec) == end_itr);
++
++      // Check if we are done. If so, create an end iterator.
++      if (State->Stack.empty())
++         State.reset();
++   }
++
++   /// Does not go down into the current directory_entry.
++   void no_push() { State->HasNoPushRequest = true; }
++
++   bool operator==(const recursive_directory_iterator_l &RHS) const {
++      return State == RHS.State;
++   }
++
++   bool operator!=(const recursive_directory_iterator_l &RHS) const {
++      return !(*this == RHS);
++   }
++
++};
+--- llvm/lib/Support/Windows/Path.inc	sam. avr.  7 02:32:59 2018
++++ llvm/lib/Support/Windows/Path_new.inc	jeu. août 23 11:12:17 2018
+@@ -1000,0 +1001,121 @@ std::error_code detail::directory_iterator_constru
++std::error_code detail::directory_iterator_construct(detail::DirIterState_r &it,
++   StringRef path,
++   bool follow_symlinks, const std::regex& regex, const pattern_options& options) {
++   SmallVector<wchar_t, 128> path_utf16;
++
++   if (std::error_code ec = widenPath(path, path_utf16))
++      return ec;
++
++   // Convert path to the format that Windows is happy with.
++   if (path_utf16.size() > 0 &&
++      !is_separator(path_utf16[path.size() - 1]) &&
++      path_utf16[path.size() - 1] != L':') {
++      path_utf16.push_back(L'\\');
++      path_utf16.push_back(L'*');
++   }
++   else {
++      path_utf16.push_back(L'*');
++   }
++
++   //  Get the first directory entry.
++   WIN32_FIND_DATAW FirstFind;
++   ScopedFindHandle FindHandle(::FindFirstFileExW(
++      c_str(path_utf16), FindExInfoBasic, &FirstFind, FindExSearchNameMatch,
++      NULL, FIND_FIRST_EX_LARGE_FETCH));
++   if (!FindHandle)
++      return mapWindowsError(::GetLastError());
++
++   size_t FilenameLen = ::wcslen(FirstFind.cFileName);
++   SmallString<128> directory_entry_name_utf8;
++
++   while ((FilenameLen == 1 && FirstFind.cFileName[0] == L'.') ||
++      (FilenameLen == 2 && FirstFind.cFileName[0] == L'.' &&
++         FirstFind.cFileName[1] == L'.') || (file_type_from_attrs(FirstFind.dwFileAttributes) != file_type::directory_file && !std::regex_match(directory_entry_name_utf8.c_str(), regex)) )
++      if (!::FindNextFileW(FindHandle, &FirstFind)) {
++         DWORD LastError = ::GetLastError();
++         // Check for end.
++         if (LastError == ERROR_NO_MORE_FILES)
++            return detail::directory_iterator_destruct(it);
++         return mapWindowsError(LastError);
++      }
++      else
++      {
++         FilenameLen = ::wcslen(FirstFind.cFileName);
++         if (std::error_code ec =
++            UTF16ToUTF8(FirstFind.cFileName, FilenameLen,
++               directory_entry_name_utf8))
++            return ec;
++      }
++
++   it.IterationHandle = intptr_t(FindHandle.take());
++   SmallString<128> directory_entry_path(path);
++   path::append(directory_entry_path, directory_entry_name_utf8);
++   it.CurrentEntry = directory_entry(directory_entry_path, follow_symlinks,
++      status_from_find_data(&FirstFind));
++
++   it.regex = regex;
++   it.options = options;
++
++   return std::error_code();
++}
++
++std::error_code detail::directory_iterator_construct(detail::DirIterState_l &it,
++   StringRef path,
++   bool follow_symlinks, const std::function<bool(const char*)>& lambda, const pattern_options& options) {
++   SmallVector<wchar_t, 128> path_utf16;
++
++   if (std::error_code ec = widenPath(path, path_utf16))
++      return ec;
++
++   // Convert path to the format that Windows is happy with.
++   if (path_utf16.size() > 0 &&
++      !is_separator(path_utf16[path.size() - 1]) &&
++      path_utf16[path.size() - 1] != L':') {
++      path_utf16.push_back(L'\\');
++      path_utf16.push_back(L'*');
++   }
++   else {
++      path_utf16.push_back(L'*');
++   }
++
++   //  Get the first directory entry.
++   WIN32_FIND_DATAW FirstFind;
++   ScopedFindHandle FindHandle(::FindFirstFileExW(
++      c_str(path_utf16), FindExInfoBasic, &FirstFind, FindExSearchNameMatch,
++      NULL, FIND_FIRST_EX_LARGE_FETCH));
++   if (!FindHandle)
++      return mapWindowsError(::GetLastError());
++
++   size_t FilenameLen = ::wcslen(FirstFind.cFileName);
++   SmallString<128> directory_entry_name_utf8;
++   while ((FilenameLen == 1 && FirstFind.cFileName[0] == L'.') ||
++      (FilenameLen == 2 && FirstFind.cFileName[0] == L'.' &&
++         FirstFind.cFileName[1] == L'.') || (file_type_from_attrs(FirstFind.dwFileAttributes) != file_type::directory_file && !lambda(directory_entry_name_utf8.c_str())))
++      if (!::FindNextFileW(FindHandle, &FirstFind)) {
++         DWORD LastError = ::GetLastError();
++         // Check for end.
++         if (LastError == ERROR_NO_MORE_FILES)
++            return detail::directory_iterator_destruct(it);
++         return mapWindowsError(LastError);
++      }
++      else
++      {
++         FilenameLen = ::wcslen(FirstFind.cFileName);
++         if (std::error_code ec =
++            UTF16ToUTF8(FirstFind.cFileName, FilenameLen,
++               directory_entry_name_utf8))
++            return ec;
++      }
++
++   it.IterationHandle = intptr_t(FindHandle.take());
++   SmallString<128> directory_entry_path(path);
++   path::append(directory_entry_path, directory_entry_name_utf8);
++   it.CurrentEntry = directory_entry(directory_entry_path, follow_symlinks,
++      status_from_find_data(&FirstFind));
++
++   it.lambda = lambda;
++   it.options = options;
++
++   return std::error_code();
++}
++
+@@ -1009,0 +1131,22 @@ std::error_code detail::directory_iterator_destruc
++std::error_code detail::directory_iterator_destruct(detail::DirIterState_r &it) {
++   if (it.IterationHandle != 0)
++      // Closes the handle if it's valid.
++      ScopedFindHandle close(HANDLE(it.IterationHandle));
++   it.IterationHandle = 0;
++   it.CurrentEntry = directory_entry();
++   it.regex = std::regex("");
++   it.options = pattern_options::none;
++   return std::error_code();
++}
++
++std::error_code detail::directory_iterator_destruct(detail::DirIterState_l &it) {
++   if (it.IterationHandle != 0)
++      // Closes the handle if it's valid.
++      ScopedFindHandle close(HANDLE(it.IterationHandle));
++   it.IterationHandle = 0;
++   it.CurrentEntry = directory_entry();
++   it.lambda = {};
++   it.options = pattern_options::none;
++   return std::error_code();
++}
++
+@@ -1036,0 +1180,76 @@ std::error_code detail::directory_iterator_increme
++std::error_code detail::directory_iterator_increment(detail::DirIterState_r &it) {
++   WIN32_FIND_DATAW FindData;
++   BOOL ret = 0;
++   SmallString<128> directory_entry_path_utf8;
++
++   while ( (ret = ::FindNextFileW(HANDLE(it.IterationHandle), &FindData)) != 0) 
++   {
++      size_t FilenameLen = ::wcslen(FindData.cFileName);
++      if (std::error_code ec =
++         UTF16ToUTF8(FindData.cFileName, FilenameLen,
++            directory_entry_path_utf8))
++         return ec;
++
++      if ((FilenameLen == 1 && FindData.cFileName[0] == L'.') ||
++         (FilenameLen == 2 && FindData.cFileName[0] == L'.' &&
++            FindData.cFileName[1] == L'.') ||
++            (file_type_from_attrs(FindData.dwFileAttributes) != file_type::directory_file && !std::regex_match(directory_entry_path_utf8.c_str(), it.regex))
++         )
++         continue;
++      else
++         break;
++   }
++
++   if (!ret)
++   {
++      DWORD LastError = ::GetLastError();
++      // Check for end.
++      if (LastError == ERROR_NO_MORE_FILES)
++         return detail::directory_iterator_destruct(it);
++      return mapWindowsError(LastError);
++   }
++
++   
++
++
++   it.CurrentEntry.replace_filename(Twine(directory_entry_path_utf8),
++      status_from_find_data(&FindData));
++   return std::error_code();
++}
++
++std::error_code detail::directory_iterator_increment(detail::DirIterState_l &it) {
++   WIN32_FIND_DATAW FindData;
++   BOOL ret = 0;
++   SmallString<128> directory_entry_path_utf8;
++
++   while ((ret = ::FindNextFileW(HANDLE(it.IterationHandle), &FindData)) != 0)
++   {
++      size_t FilenameLen = ::wcslen(FindData.cFileName);
++      if (std::error_code ec =
++         UTF16ToUTF8(FindData.cFileName, FilenameLen,
++            directory_entry_path_utf8))
++         return ec;
++      if ((FilenameLen == 1 && FindData.cFileName[0] == L'.') ||
++         (FilenameLen == 2 && FindData.cFileName[0] == L'.' &&
++            FindData.cFileName[1] == L'.') ||
++            (file_type_from_attrs(FindData.dwFileAttributes) != file_type::directory_file && !it.lambda(directory_entry_path_utf8.c_str()))
++         )
++         continue;
++      else
++         break;
++   }
++
++   if (!ret)
++   {
++      DWORD LastError = ::GetLastError();
++      // Check for end.
++      if (LastError == ERROR_NO_MORE_FILES)
++         return detail::directory_iterator_destruct(it);
++      return mapWindowsError(LastError);
++   }
++
++   it.CurrentEntry.replace_filename(Twine(directory_entry_path_utf8),
++      status_from_find_data(&FindData));
++   return std::error_code();
++}
